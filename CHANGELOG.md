@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **OpticFilm 7600i v1 (GL843)**: scan-ready, capture-derived driver that replays SilverFast's scan sequences (1440 / 3600 / 7200 dpi colour, 3600 dpi infrared). See [docs/opticfilm-7600i-v1.md](docs/opticfilm-7600i-v1.md).
+
+### Changed
+
+- `MODEL_7600I_V1` moved to `device/model_7600i_v1.py` (was a 7500i SANE-table alias).
+
 ## [1.3.4] - 2026-09-25
 
 ### Added
