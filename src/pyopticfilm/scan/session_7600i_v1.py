@@ -10,11 +10,11 @@ from collections.abc import Callable
 
 import numpy as np
 
-from pyopticfilm.device.model_7600i_v1 import CALIBRATED_SHIFTS, MODEL_7600I_V1
+from pyopticfilm.device.model_7600i_v1 import MODEL_7600I_V1, shifts_for
 from pyopticfilm.exceptions import ScanError
 from pyopticfilm.image import ScanImage
 from pyopticfilm.logging import get_logger
-from pyopticfilm.scan.replay_gl843_v1 import ReplayHooks, check_cancel, prepare_profile, run_profile
+from pyopticfilm.scan.replay_gl843_v1 import ReplayHooks, check_cancel, prepare_profile, run_profile, widen_window
 
 logger = get_logger(__name__)
 
@@ -150,8 +150,11 @@ class Gl843V1ScanSession:
 
     def _scan_job(self, job, resolution, report, cancel, apply_calib, dummy_lines) -> np.ndarray:
         asic = self.asic
-        profile = prepare_profile(self.model.replay_profile(job, resolution),
-                                  dummy_lines=dummy_lines or self.model.dummy_lines)
+        profile = self.model.replay_profile(job, resolution)
+        if self.model.window_start is not None:
+            profile = widen_window(profile, self.model.window_start)
+        profile = prepare_profile(profile, dummy_lines=dummy_lines or self.model.dummy_lines,
+                                  single_sample=self.model.single_sample)
         if not asic.position_known or not asic.is_at_home():
             asic.home()
         asic.position_known = False
@@ -207,5 +210,5 @@ class Gl843V1ScanSession:
         yres = profile["yres"]
         frame = profile["frames"][main]
         return assemble(result.main, pixels=frame["pixels"], lines=frame["lines"], dpi=resolution, yres=yres,
-                        shifts=CALIBRATED_SHIFTS[yres], offsets=offsets, mirror=self.model.mirror_x,
+                        shifts=shifts_for(yres), offsets=offsets, mirror=self.model.mirror_x,
                         stagger=tuple(round(v * yres / 7200) for v in self.model.stagger_y_by_dpi[resolution]))

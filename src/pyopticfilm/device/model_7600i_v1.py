@@ -23,6 +23,12 @@ CALIBRATED_SHIFTS: dict[int, tuple[float, float, float]] = {
 _MOTOR = MotorProfile(20325, 2604, 256, 2, 0, 1024)  # unused: homing uses the vendor tables
 
 
+def shifts_for(yres: int) -> tuple[float, ...]:
+    """R/G/B line delays at ``yres`` lines/inch, scaled from the measurement at twice it if needed."""
+    ref = yres if yres in CALIBRATED_SHIFTS else 2 * yres
+    return tuple(s * yres / ref for s in CALIBRATED_SHIFTS[ref])
+
+
 @lru_cache(maxsize=1)
 def _load_data() -> dict:
     raw = resources.files("pyopticfilm.device.data").joinpath("opticfilm_7600i_v1.json.gz").read_bytes()
@@ -52,16 +58,22 @@ class Model7600iV1:
     bpp_color: tuple[int, ...] = (16,)
     supports_infrared: bool = True
     mirror_x: bool = True
-    #: CCD dummy lines: "recorded" (vendor), "fewer" or "none" (twice as fast at 3600 dpi).
-    dummy_lines: str = "recorded"
+    #: CCD dummy lines in the main scan: "none", "fewer" or "recorded" (SilverFast's).
+    dummy_lines: str = "none"
+    #: sample the nominal resolution vertically instead of twice it (SilverFast):
+    #: half the lines and scan time, without SilverFast's line-pair averaging.
+    single_sample: bool = True
+    #: first sensor pixel of the scan window: 80, the first lit pixel (the full area, 36.61 mm;
+    #: 82 at 3600 dpi to keep an even pixel count). SilverFast starts at 210. None keeps it.
+    window_start: int | None = 80
     lamp_warmup_s: float = 1.0
-    x_size_mm: float = 36.15
+    x_size_mm: float = 36.61
     y_size_mm: float = 24.72
     x_offset_ta_mm: float = 0.0
     y_offset_ta_mm: float = 0.0
-    x_size_ta_mm: float = 36.15
+    x_size_ta_mm: float = 36.61
     y_size_ta_mm: float = 24.72
-    x_size_calib_mm: float = 36.15
+    x_size_calib_mm: float = 36.61
     y_size_calib_ta_mm: float = 0.0
     y_offset_calib_white_ta_mm: float = 0.0
     y_offset_sensor_to_ta_mm: float = 0.0

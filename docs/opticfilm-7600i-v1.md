@@ -8,6 +8,8 @@ that resolution, from USB captures of a real 7600i v1 (sequences and findings fr
 | | |
 |---|---|
 | Colour | 1440, 3600, 7200 dpi full frame, 16-bit linear RGB |
+| Speed | the main scan samples the nominal resolution once vertically (SilverFast samples twice and averages pairs), no CCD dummy lines, MAXWD two lines, BUFSEL 0x10 and backtracking off (0x02 ACDCDIS), so a busy host pauses the carriage instead of reversing it. 7200 dpi: image in ~52 s at 8.5 MB/s, whole job ~84 s (SilverFast's timing: 237 s). `single_sample=False` and `dummy_lines="recorded"` restore SilverFast's job |
+| Area | 36.61 × 24.72 mm: sensor pixels 80–10458 (3600 dpi: 82–10458; 1440 dpi: 83–10463), the full area. SilverFast's window is 210–10458 (36.15 mm). The pixel count must stay even: with an odd count the scanner sends a pixel less per line and the read stalls |
 | Infrared | 3600, 7200 dpi (`mode="infrared"`, or `infrared=True` with colour) |
 | Crop | `area=`, on the host |
 | Not yet | multi-exposure, other resolutions, grey |
@@ -23,6 +25,10 @@ Differences from the SANE GL843 path:
 - Infrared at 7200 dpi was not captured: it is the 7200 dpi colour job with the changes SilverFast
   makes for infrared at 3600 dpi (lamp off, infrared LED, AFE), and shading computed from the job's
   white frame as SilverFast does (`0x13000 × 0x2000 / white`).
+
+- The wider window adds pixels in front of the recorded shading tables. While the white frame is
+  read they take the first recorded pixels' words (per column parity); afterwards their gains are
+  computed from the white frame to reach the level the recorded gains give the first recorded pixels.
 
 Validation: `tests/test_opticfilm_7600i_v1.py` replays every job against strict playback of the
 capture (any transfer that differs from SilverFast's fails), and covers boot, homing, image

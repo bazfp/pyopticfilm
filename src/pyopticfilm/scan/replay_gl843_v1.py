@@ -46,11 +46,15 @@ def _table(data: str) -> list[int]:
     return [b[i] | (b[i + 1] << 8) for i in range(0, len(b) - 1, 2)]
 
 
-def prepare_profile(profile: dict, *, dummy_lines: str = "recorded", exposure_multiplier: int = 1) -> dict:
+def prepare_profile(profile: dict, *, dummy_lines: str = "recorded", exposure_multiplier: int = 1,
+                    single_sample: bool = False) -> dict:
     """Set the main scan's CCD dummy lines (``recorded`` / ``fewer`` / ``none``) or exposure ×k.
 
     LINESEL L' instead of L scales the main-scan motor cruise to ``C*k*(L'+1)/(L+1)``. Exposure ×k
-    also writes LPERIOD×k and BUFSEL 0x08 (k=3 is SilverFast's multi-exposure pass).
+    also writes LPERIOD×k and BUFSEL 0x08 (k=3 is SilverFast's multi-exposure pass); fewer dummy
+    lines alone write MAXWD two lines, BUFSEL 0x10 and backtracking off. ``single_sample`` samples
+    the nominal resolution vertically, not twice it: half the lines, each
+    twice as many motor steps (half the cruise period).
     """
     if dummy_lines not in {"recorded", "fewer", "none"} or exposure_multiplier not in {1, 2, 3, 4}:
         raise ValueError("dummy_lines must be recorded/fewer/none and exposure_multiplier 1-4")
@@ -59,7 +63,7 @@ def prepare_profile(profile: dict, *, dummy_lines: str = "recorded", exposure_mu
         line_sel = 0
     else:
         line_sel = max(0, recorded - 1) if dummy_lines == "fewer" else recorded
-    if line_sel == recorded and exposure_multiplier == 1:
+    if line_sel == recorded and exposure_multiplier == 1 and not single_sample:
         return profile
     k = exposure_multiplier
     ops = profile["ops"]
@@ -84,7 +88,7 @@ def prepare_profile(profile: dict, *, dummy_lines: str = "recorded", exposure_mu
     if not tables:
         raise AsicError("profile has no main-scan motor table")
     cruise = _table(ops[tables[0]]["data"])[-1]
-    nxt = cruise * factor
+    nxt = cruise * factor / (2 if single_sample else 1)  # steps per line = (L+1) * LPERIOD / cruise
     if nxt != int(nxt) or not 0 < nxt <= 0xFFFF:
         raise AsicError("dummy line change does not give a whole motor period")
     nxt = int(nxt)
@@ -102,6 +106,20 @@ def prepare_profile(profile: dict, *, dummy_lines: str = "recorded", exposure_mu
     changed = {0x1E: (line_reg & 0xF0) | line_sel}
     if k > 1:
         changed.update({0x38: lp >> 8, 0x39: lp & 0xFF, 0x20: 0x08})
+    elif line_sel != recorded:
+        maxwd = profile["frames"][main]["pixels"] * 6 >> 1  # in 4-byte units: two lines
+        changed.update({0x35: maxwd >> 16, 0x36: (maxwd >> 8) & 0xFF, 0x37: maxwd & 0xFF, 0x20: 0x10,
+                        0x02: profile["frames"][main]["regs"]["2"] | 0x40})  # ACDCDIS: no backtracking
+    lines = profile["frames"][main]["lines"]
+    if single_sample:
+        lines //= 2
+        changed.update({0x25: (2 * lines) >> 16, 0x26: (2 * lines >> 8) & 0xFF, 0x27: 2 * lines & 0xFF})  # LINCNT
+        n = profile["frames"][main]["pixels"] * lines * 6
+        if new_ops[first_read]["length"] != profile["frames"][main]["bytes"]:
+            raise AsicError("main frame is not read in one piece")
+        new_ops[first_read] = {**new_ops[first_read], "length": n}
+        setup = next(i for i in range(first_read - 1, -1, -1) if new_ops[i].get("value") == 0x82)
+        new_ops[setup] = _with_length(new_ops[setup], n)
     d = new_ops[start]["data"]
     data: list[int] = []
     for j in range(0, len(d), 2):
@@ -110,12 +128,14 @@ def prepare_profile(profile: dict, *, dummy_lines: str = "recorded", exposure_mu
         data += [d[j], d[j + 1]]
     new_ops[start] = {**new_ops[start], "data": data}
     frames = list(profile["frames"])
-    frames[main] = {**frames[main], "regs": {**frames[main]["regs"], **{str(a): v for a, v in changed.items()}}}
-    scan = {**profile["scan"], "lineSel": line_sel, "lPeriod": lp,
+    frames[main] = {**frames[main], "lines": lines, "bytes": frames[main]["pixels"] * lines * 6,
+                    "regs": {**frames[main]["regs"], **{str(a): v for a, v in changed.items()}}}
+    scan = {**profile["scan"], "lineSel": line_sel, "lPeriod": lp, "backtracking": not changed.get(0x02, 0) & 0x40,
             "lineSeconds": round(profile["scan"]["lineSeconds"] * factor, 6),
-            "seconds": round(profile["scan"]["seconds"] * factor, 1),
+            "seconds": round(profile["scan"]["seconds"] * factor * lines / profile["frames"][main]["lines"], 1),
             "bytesPerSecond": round(profile["scan"]["bytesPerSecond"] / factor)}
-    return {**profile, "ops": new_ops, "frames": frames, "scan": scan,
+    yres = profile["yres"] // 2 if single_sample else profile["yres"]
+    return {**profile, "ops": new_ops, "frames": frames, "scan": scan, "yres": yres,
             "motorCruise": {"recorded": cruise, "used": nxt}}
 
 
@@ -171,6 +191,114 @@ def white_shading(white: bytes, pixels: int) -> bytes:
     """Infrared shading from a white frame read at unity gain."""
     mean = np.frombuffer(white, "<u2").reshape(-1, pixels, 3).mean(axis=0)
     return shading_table(np.clip(np.rint(IR_SHADING_TARGET * SHADING_UNITY / np.maximum(mean, 1)), 0, 0xFFFF))
+
+
+def _widen_words(table: bytes, pixels: int, extra: int) -> np.ndarray:
+    """A shading table's per-pixel words with ``extra`` pixels in front: the median of the first
+    recorded pixels of the same column parity (dark words differ between even and odd columns)."""
+    words = np.frombuffer(table, "<u2").reshape(-1, 256)[:, :252].reshape(-1, 6)[:pixels]
+    ref = np.stack([np.median(words[p:16:2], axis=0) for p in range(2)])
+    return np.concatenate([np.rint(ref[(np.arange(extra) - extra) % 2]), words]).astype("<u2")
+
+
+def _shading_blocks(words: np.ndarray) -> bytes:
+    n = -(-len(words) // 42)
+    blocks = np.zeros((n, 256), "<u2")
+    blocks[:, :252] = np.concatenate([words, np.zeros((n * 42 - len(words), 6), "<u2")]).reshape(n, 252)
+    return blocks.tobytes()
+
+
+def widened_shading(table: bytes, extra: int, white: bytes, pixels: int) -> bytes:
+    """A recorded final shading table with ``extra`` pixels added in front, whose gains bring the
+    white frame (read at unity gain) to the level the recorded gains give its first pixels."""
+    mean = np.maximum(np.frombuffer(white, "<u2").reshape(-1, pixels, 3).mean(axis=0), 1)
+    words = _widen_words(table, pixels - extra, extra)
+    target = np.median(words[extra : extra + 16, 1::2] * mean[extra : extra + 16], axis=0)
+    words[:extra, 1::2] = np.clip(np.rint(target / mean[:extra]), 0, 0xFFFF)
+    return _shading_blocks(words)
+
+
+def _with_length(setup: dict, n: int) -> dict:
+    """A bulk set-up (``0x82``) for ``n`` bytes."""
+    return {**setup, "data": setup["data"][:4] + list(n.to_bytes(4, "little"))}
+
+
+def widen_window(profile: dict, start: int) -> dict:
+    """Start the dark, white and main frames at sensor pixel ``start`` (or the next one that keeps
+    the recorded pixel count even) instead of the recorded STRPIXEL; ENDPIXEL is unchanged.
+
+    The shading uploads gain the added pixels: words copied from the first recorded pixels while
+    the white frame is read, then gains computed from it (:func:`widened_shading`).
+    """
+    main = profile["mainFrame"]
+    regs = profile["frames"][main]["regs"]
+    old = regs["48"] << 8 | regs["49"]
+    step = 1200 // (regs["44"] << 8 | regs["45"])
+    extra = (old - start) // step // 2 * 2  # an even pixel count: the chip sends no odd last pixel
+    if extra <= 0:
+        return profile
+    new = old - extra * step
+    frames = []
+    for f in profile["frames"]:
+        if f["regs"]["48"] << 8 | f["regs"]["49"] == old:
+            px = f["pixels"] + extra
+            f = {**f, "pixels": px, "bytes": px * f["lines"] * 6, "regs": {**f["regs"], "48": new >> 8, "49": new & 0xFF}}
+        frames.append(f)
+    white = profile["lamp"]["shading"]["frame"]
+    pixels = frames[white]["pixels"]
+    size = -(-pixels // 42) * 512
+    ops = list(profile["ops"])
+    regs: dict[int, int] = {}
+    header = -1
+    headers: dict[int, int] = {}  # shading write -> its bulk set-up
+    uploads: dict[bool, list[int]] = {False: [], True: []}  # before / after the white frame is read
+    white_read = False
+    for i, o in enumerate(ops):
+        if o["kind"] == "control" and o["rt"] == 0x40 and o["value"] == 0x82:
+            header = i
+        elif o["kind"] == "control" and o["rt"] == 0x40 and o["value"] == 0x83 and len(o["data"]) > 1:
+            pairs = dict(zip(o["data"][::2], o["data"][1::2], strict=True))
+            regs.update(pairs)
+            if (pairs.get(0x30), pairs.get(0x31)) == (old >> 8, old & 0xFF):
+                pairs.update({0x30: new >> 8, 0x31: new & 0xFF})
+                ops[i] = {**o, "data": [b for item in pairs.items() for b in item]}
+        elif o["kind"] == "read":
+            white_read |= o["frame"] == white
+            n = frames[o["frame"]]["bytes"]
+            if n != profile["frames"][o["frame"]]["bytes"]:
+                if o["length"] != profile["frames"][o["frame"]]["bytes"]:
+                    raise AsicError("widened frame is not read in one piece")
+                ops[i] = {**o, "length": n}
+                ops[header] = _with_length(ops[header], n)
+        elif o["kind"] == "write" and (regs.get(0x5B), regs.get(0x5C)) == (0x10, 0x00):
+            uploads[white_read].append(i)
+            headers[i] = header
+    used = pixels // 42 * 512 + pixels % 42 * 12  # a set-up counts the table without its last block's padding
+    for live, idx in uploads.items():
+        if not idx:
+            raise AsicError("shading uploads not found")
+        lengths = [ops[i].get("length") or len(base64.b64decode(ops[i]["data"])) for i in idx]
+        last = [i for i in idx if headers[i] == headers[idx[-1]]]
+        lengths[-1] = size - sum(lengths[:-1])
+        tail = used - (sum(lengths) - sum(lengths[-len(last):]))  # the last set-up's new length
+        if lengths[-1] <= 0 or tail <= 0:
+            raise AsicError("widened shading does not fit the recorded uploads")
+        ops[headers[idx[-1]]] = _with_length(ops[headers[idx[-1]]], tail)
+        recorded = b"".join(base64.b64decode(ops[i]["data"]) for i in idx if "data" in ops[i])
+        table = b"" if live else _shading_blocks(_widen_words(recorded, pixels - extra, extra))
+        at = 0
+        for i, n in zip(idx, lengths, strict=True):
+            if "shading" in ops[i]:  # already computed from the white frame
+                ops[i] = {**ops[i], "length": n}
+            elif live:
+                ops[i] = {"kind": "write", "length": n, "shading": {
+                    "frame": white, "offset": at, "widen": {"table": base64.b64encode(recorded).decode(), "extra": extra}}}
+            else:
+                ops[i] = {**ops[i], "data": base64.b64encode(table[at : at + n]).decode()}
+            at += n
+    scan = {**profile["scan"], "bytesPerSecond": round(
+        profile["scan"]["bytesPerSecond"] * frames[main]["pixels"] / profile["frames"][main]["pixels"])}
+    return {**profile, "ops": ops, "frames": frames, "scan": scan}
 
 
 def _full(op: dict) -> tuple:
@@ -307,7 +435,8 @@ def run_profile(profile: dict, usb, hooks: ReplayHooks | None = None) -> ReplayR
     main = profile["mainFrame"]
     lamp = profile.get("lamp") or {}
     calib_frames = {lamp[k]["frame"] for k in ("line", "shading", "dark") if k in lamp}
-    need = profile["scan"]["bytesPerSecond"]
+    # without backtracking a slow host only pauses the carriage, so the rate is not enforced
+    need = profile["scan"]["bytesPerSecond"] if profile["scan"].get("backtracking", True) else 0
     regs: dict[int, int] = {}
     st = {"address": 0, "status": None, "moved": None}
     buffers = {i: bytearray(frames[i]["bytes"]) for i in calib_frames | {main}}
@@ -449,7 +578,10 @@ def run_profile(profile: dict, usb, hooks: ReplayHooks | None = None) -> ReplayR
                 if "shading" in op:
                     f, start = op["shading"]["frame"], op["shading"]["offset"]
                     if f not in shading:
-                        shading[f] = white_shading(result.frames[f], frames[f]["pixels"])
+                        w = op["shading"].get("widen")
+                        shading[f] = (widened_shading(base64.b64decode(w["table"]), w["extra"], result.frames[f],
+                                                      frames[f]["pixels"]) if w
+                                      else white_shading(result.frames[f], frames[f]["pixels"]))
                     payload = shading[f][start : start + op["length"]]
                 else:
                     payload = base64.b64decode(op["data"])

@@ -21,6 +21,8 @@ from pyopticfilm.scan.replay_gl843_v1 import (
     shading_table,
     validate_profile,
     white_shading,
+    widen_window,
+    widened_shading,
 )
 from pyopticfilm.scan.session import create_session
 from pyopticfilm.scan.session_7600i_v1 import Gl843V1ScanSession, assemble, crop
@@ -182,6 +184,20 @@ def test_dummy_lines_scale_the_motor_cruise(dpi, setting, line_sel, cruise):
     assert prepare_profile(recorded) is recorded
 
 
+def test_single_sample_halves_the_lines():
+    recorded = MODEL_7600I_V1.replay_profile("color", 7200)
+    p = prepare_profile(recorded, dummy_lines="none", single_sample=True)
+    validate_profile(p)
+    f = p["frames"][p["mainFrame"]]
+    assert (f["lines"], f["bytes"], p["yres"]) == (7061, 10248 * 7061 * 6, 7200)
+    assert p["motorCruise"] == {"recorded": 42000, "used": 7000}  # 2 steps per line
+    regs = dict(zip(_main_start_write(p)[::2], _main_start_write(p)[1::2], strict=True))
+    assert regs[0x25] << 16 | regs[0x26] << 8 | regs[0x27] == 2 * 7061  # LINCNT
+    assert regs[0x35] << 16 | regs[0x36] << 8 | regs[0x37] == 10248 * 3  # MAXWD: two lines
+    assert (regs[0x20], regs[0x02] & 0x40) == (0x10, 0x40)  # BUFSEL, no backtracking
+    assert p["scan"]["backtracking"] is False
+
+
 def test_exposure_x3_reproduces_silverfast_multi_exposure_pass():
     p = prepare_profile(MODEL_7600I_V1.replay_profile("color", 3600), exposure_multiplier=3)
     start = _main_start_write(p)
@@ -190,6 +206,38 @@ def test_exposure_x3_reproduces_silverfast_multi_exposure_pass():
     assert regs[0x1E] & 0x0F == 0  # no dummy lines
     assert regs[0x20] == 0x08  # BUFSEL
     assert p["motorCruise"] == {"recorded": 14000, "used": 21000}
+
+
+@pytest.mark.parametrize(("mode", "dpi", "start", "pixels"), [
+    ("color", 1440, 83, 2076), ("color", 3600, 82, 5188), ("color", 7200, 80, 10378),
+    ("infrared", 3600, 82, 5188), ("infrared", 7200, 80, 10378),
+])
+def test_full_window_starts_at_the_first_lit_pixel(mode, dpi, start, pixels):
+    p = widen_window(MODEL_7600I_V1.replay_profile(mode, dpi), 80)
+    validate_profile(p)
+    for i in (5, 6, 7):  # dark, white, image
+        f = p["frames"][i]
+        assert (f["regs"]["48"] << 8 | f["regs"]["49"], f["pixels"]) == (start, pixels)
+    setup, payload = None, 0
+    for o in p["ops"] + [{"kind": "control", "rt": 0x40, "value": 0x82, "data": [0] * 8}]:
+        if o["kind"] == "control" and o["rt"] == 0x40 and o["value"] == 0x82:
+            if setup is not None:  # a read gets its exact length, an upload its table before padding
+                n = int.from_bytes(bytes(setup[4:8]), "little")
+                assert n == payload if setup[0] == 0 else n <= payload < n + 512
+            setup, payload = o["data"], 0
+        elif o["kind"] in ("read", "write"):
+            payload += o.get("length") or len(base64.b64decode(o["data"]))
+
+
+def test_widened_shading_brings_added_pixels_to_the_recorded_level():
+    p = widen_window(MODEL_7600I_V1.replay_profile("color", 3600), 80)
+    w = next(o["shading"] for o in p["ops"] if "shading" in o)
+    pixels = p["frames"][w["frame"]]["pixels"]
+    white = np.full((2, pixels, 3), 50000, "<u2")
+    white[:, : w["widen"]["extra"]] = 25000  # added pixels half as bright
+    table = widened_shading(base64.b64decode(w["widen"]["table"]), w["widen"]["extra"], white.tobytes(), pixels)
+    words = np.frombuffer(table, "<u2").reshape(-1, 256)[:, :252].reshape(-1, 6)
+    assert np.allclose(words[0, 1::2], 2 * np.median(words[64:80, 1::2], axis=0), rtol=1e-3)
 
 
 # --------------------------------------------------------------------------- register protocol
@@ -282,6 +330,12 @@ def test_assembly_aligns_channels_and_stagger():
     assert out[y, 0, 0] == 2 * y + 8 + 1  # even column: 8 raw lines later
 
 
+def test_default_frame_crop_is_the_whole_window():
+    from pyopticfilm.scan.bringup import default_frame_crop_norm
+
+    assert default_frame_crop_norm(MODEL_7600I_V1) == (0.0, 0.0, 1.0, 1.0)  # NegPy calls it for every model
+
+
 def test_crop_uses_normalised_area():
     rgb = np.zeros((100, 200, 3), np.uint16)
     assert crop(rgb, (0.25, 0.1, 0.75, 0.6)).shape == (50, 100, 3)
@@ -303,7 +357,7 @@ def test_scanner_end_to_end_on_simulated_scanner(monkeypatch, tmp_path):
         scanner.warmup()
         assert scanner.status().is_at_home
         image = scanner.scan(resolution=1440)
-    assert image.rgb.shape == (1402, 2050, 3) and image.rgb.dtype == np.uint16
+    assert image.rgb.shape == (1402, 2076, 3)  # sensor pixels 83-10463 and image.rgb.dtype == np.uint16
     assert image.dpi == 1440 and image.ir is None
     # simulated light level minus the measured black-level difference
     assert abs(int(image.rgb[700, 1000, 1]) - (sim.lit_rgb[1] - (sim.dark_rgb[1] - 1059.5))) <= 1

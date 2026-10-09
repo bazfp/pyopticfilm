@@ -334,10 +334,14 @@ class UsbDeviceHandle:
                 logger.debug("Kernel detach skipped: %s", exc)
 
             try:
-                dev.set_configuration()
-            except usb_core.USBError as exc:
-                # Already configured is common and fine.
-                logger.debug("set_configuration: %s", exc)
+                # Configure only an unconfigured device: setting it again resets the host's bulk
+                # data toggles but not the 7600i's GL843, so the next session lost its first packet.
+                dev.get_active_configuration()
+            except usb_core.USBError:
+                try:
+                    dev.set_configuration()
+                except usb_core.USBError as exc:
+                    logger.debug("set_configuration: %s", exc)
 
             cfg = dev.get_active_configuration()
             intf = cfg[(0, 0)]
