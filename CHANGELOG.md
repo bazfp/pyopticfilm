@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - OpticFilm 7600i v1: the main scan, colour and infrared, by default is sampled once vertically, with no CCD dummy lines, a two-line buffer threshold and no backtracking. 7200 dpi takes ~84 s instead of ~260 s.
+- OpticFilm 7600i v1: shading gains are computed from each scan's white frame; the recorded gains left ~1 % unevenness across the width.
 - OpticFilm 7600i v1: the scan window is the full area, 36.61 mm wide from the first lit sensor pixel (was SilverFast's 36.15 mm).
 - `MODEL_7600I_V1` moved to `device/model_7600i_v1.py` (was a 7500i SANE-table alias).
 

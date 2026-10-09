@@ -27,8 +27,8 @@ Differences from the SANE GL843 path:
   white frame as SilverFast does (`0x13000 × 0x2000 / white`).
 
 - The wider window adds pixels in front of the recorded shading tables. While the white frame is
-  read they take the first recorded pixels' words (per column parity); afterwards their gains are
-  computed from the white frame to reach the level the recorded gains give the first recorded pixels.
+  read they take the first recorded pixels' words (per column parity). All final gains are computed
+  from the job's white frame (`target / white`, per-channel target from the recorded gains).
 
 Validation: `tests/test_opticfilm_7600i_v1.py` replays every job against strict playback of the
 capture (any transfer that differs from SilverFast's fails), and covers boot, homing, image

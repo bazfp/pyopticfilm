@@ -209,12 +209,12 @@ def _shading_blocks(words: np.ndarray) -> bytes:
 
 
 def widened_shading(table: bytes, extra: int, white: bytes, pixels: int) -> bytes:
-    """A recorded final shading table with ``extra`` pixels added in front, whose gains bring the
-    white frame (read at unity gain) to the level the recorded gains give its first pixels."""
+    """A recorded final shading table with ``extra`` pixels added in front, every gain computed from
+    the white frame (read at unity gain) for the per-channel target the recorded gains give."""
     mean = np.maximum(np.frombuffer(white, "<u2").reshape(-1, pixels, 3).mean(axis=0), 1)
     words = _widen_words(table, pixels - extra, extra)
-    target = np.median(words[extra : extra + 16, 1::2] * mean[extra : extra + 16], axis=0)
-    words[:extra, 1::2] = np.clip(np.rint(target / mean[:extra]), 0, 0xFFFF)
+    target = np.median(words[extra:, 1::2] * mean[extra:], axis=0)
+    words[:, 1::2] = np.clip(np.rint(target / mean), 0, 0xFFFF)
     return _shading_blocks(words)
 
 
