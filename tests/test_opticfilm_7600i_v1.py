@@ -15,9 +15,12 @@ from pyopticfilm.device.select import create_asic, model_for_device, model_is_sc
 from pyopticfilm.scan.replay_gl843_v1 import (
     ReplayHooks,
     collapse_recorded_waits,
+    derive_infrared,
     prepare_profile,
     run_profile,
+    shading_table,
     validate_profile,
+    white_shading,
 )
 from pyopticfilm.scan.session import create_session
 from pyopticfilm.scan.session_7600i_v1 import Gl843V1ScanSession, assemble, crop
@@ -76,8 +79,48 @@ def test_data_file_has_every_job_with_provenance():
 
 
 def test_unknown_job_is_refused():
-    with pytest.raises(ValueError, match="no infrared sequence at 7200"):
-        MODEL_7600I_V1.replay_profile("infrared", 7200)
+    with pytest.raises(ValueError, match="no infrared sequence at 1440"):
+        MODEL_7600I_V1.replay_profile("infrared", 1440)
+
+
+# --------------------------------------------------------------------------- infrared 7200 (derived)
+
+
+def _lamp_sequence(profile: dict) -> list[str]:
+    out = []
+    for o in profile["ops"]:
+        if o["kind"] == "read" and (not out or out[-1] != f"read {o['frame']}"):
+            out.append(f"read {o['frame']}")
+        elif o["kind"] == "control" and o["rt"] == 0x40 and o["value"] == 0x83 and len(o["data"]) > 1:
+            out += [f"{r:02x}={v:02x}" for r, v in zip(o["data"][::2], o["data"][1::2]) if r in (0x03, 0xA8)]
+    return out
+
+
+def test_infrared_derivation_reproduces_the_captured_3600_job():
+    profiles = MODEL_7600I_V1.replay_data()["profiles"]
+    derived = derive_infrared(profiles["color_3600"], profiles["color_3600"], profiles["infrared_3600"])
+
+    def kept(ops):  # without polls, delays and shading data
+        return [(o["kind"], o.get("data"), o.get("frame")) for o in ops if o["kind"] in ("control", "read")
+                and not (o["kind"] == "control" and (o["rt"] == 0xC0 or o["data"] == [0x41]))]
+
+    assert kept(derived["ops"]) == kept(profiles["infrared_3600"]["ops"])
+    ir7200 = MODEL_7600I_V1.replay_profile("infrared", 7200)
+    assert _lamp_sequence(ir7200) == _lamp_sequence(profiles["infrared_3600"])
+    validate_profile(ir7200)
+
+
+def test_infrared_shading_matches_silverfast():
+    # unity-gain white of 59000 / 61000 -> gain 0x13000 * 0x2000 / white
+    pixels = 43
+    white = np.full((4, pixels, 3), 59000, "<u2")
+    white[:, 42] = 61000
+    words = np.frombuffer(white_shading(white.tobytes(), pixels), "<u2").reshape(-1, 256)
+    assert words.shape == (2, 256) and not words[:, 252:].any()
+    assert list(words[0, :6]) == [0, round(0x13000 * 0x2000 / 59000)] * 3
+    assert list(words[1, :6]) == [0, round(0x13000 * 0x2000 / 61000)] * 3
+    assert list(shading_table(np.full((1, 3), 0x2000), (962, 1054, 1362))[:12]) == list(
+        np.array([962, 0x2000, 1054, 0x2000, 1362, 0x2000], "<u2").tobytes())
 
 
 # --------------------------------------------------------------------------- vendor traffic
@@ -272,7 +315,7 @@ def test_unsupported_requests_are_refused(tmp_path):
     with Scanner.open_fake(MODEL_7600I_V1, SimulatedGl843V1Transport(), calib_cache=tmp_path / "c.json") as s:
         with pytest.raises(ValueError, match="1440, 3600, 7200"):
             s.scan(resolution=1800)
-        with pytest.raises(ValueError, match="infrared at 3600 dpi only"):
+        with pytest.raises(ValueError, match="infrared at 3600, 7200 dpi"):
             s.scan(resolution=1440, mode="infrared")
         with pytest.raises(NotImplementedError):
             s.scan(resolution=3600, multi_exposure=True)

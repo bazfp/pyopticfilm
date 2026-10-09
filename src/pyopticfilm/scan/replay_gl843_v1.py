@@ -8,10 +8,13 @@ before a start, FEEDFSH after the job's own move, BUFEMPTY before image reads.
 from __future__ import annotations
 
 import base64
+import difflib
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+
+import numpy as np
 
 from pyopticfilm.exceptions import AsicError, ScanCancelled, ScanError
 
@@ -23,6 +26,9 @@ CHUNK = 0x40000
 PACKET = 512
 THROUGHPUT_GRACE_S = 6.0
 THROUGHPUT_MIN = 0.9
+SHADING_UNITY = 0x2000
+#: SilverFast's infrared shading: no dark offset, gain = target * unity / white (all channels)
+IR_SHADING_TARGET = 0x13000
 
 _ADDR_OP = {"kind": "control", "rt": 0x40, "request": 0x0C, "value": 0x83, "index": 0, "data": [STATUS]}
 _ACK_OP = {"kind": "control", "rt": 0xC0, "request": 0x0C, "value": 0x8E, "index": 0x20, "length": 1}
@@ -150,6 +156,106 @@ def collapse_recorded_waits(ops: list[dict]) -> list[dict]:
     return ops if len(out) == len(ops) else out
 
 
+def shading_table(gains: np.ndarray, dark: tuple[int, int, int] = (0, 0, 0)) -> bytes:
+    """GL843 shading upload: dark and gain words for R, G, B per pixel, 42 pixels per 512 bytes."""
+    n = -(-len(gains) // 42)
+    words = np.zeros((n * 42, 6), "<u2")
+    words[:, 0::2] = dark
+    words[: len(gains), 1::2] = gains
+    blocks = np.zeros((n, 256), "<u2")
+    blocks[:, :252] = words.reshape(n, 252)
+    return blocks.tobytes()
+
+
+def white_shading(white: bytes, pixels: int) -> bytes:
+    """Infrared shading from a white frame read at unity gain."""
+    mean = np.frombuffer(white, "<u2").reshape(-1, pixels, 3).mean(axis=0)
+    return shading_table(np.clip(np.rint(IR_SHADING_TARGET * SHADING_UNITY / np.maximum(mean, 1)), 0, 0xFFFF))
+
+
+def _full(op: dict) -> tuple:
+    if op["kind"] == "control":
+        return (op["rt"], op["value"], op["index"], tuple(op["data"]) if op["rt"] == 0x40 else op.get("register"))
+    return (op["kind"], op.get("frame"), op.get("ms"), op.get("timedStop"))
+
+
+def _shape(op: dict) -> tuple:
+    d = op.get("data")
+    if op["kind"] == "control" and op["rt"] == 0x40 and op["value"] == 0x83 and len(d) > 1:
+        return (0x83, tuple(d[::2]))  # same registers, any values
+    if op["kind"] == "control":
+        return _full(op)
+    return (op["kind"], op.get("frame"), op.get("timedStop"))
+
+
+def _is_poll(op: dict) -> bool:
+    return op["kind"] == "control" and (op["rt"] == 0xC0 or op["data"] == [STATUS])
+
+
+def derive_infrared(color: dict, color_ref: dict, ir_ref: dict) -> dict:
+    """The infrared job at ``color``'s resolution: ``color`` with the changes from ``color_ref`` to
+    ``ir_ref`` (lamp off and infrared LED on, AFE values), and shading from the job's white frame.
+
+    Changes to polls and delays only are left out: polls are live waits, and ``color`` keeps its timing.
+    """
+    ops = color["ops"]
+    ref, ir = color_ref["ops"], ir_ref["ops"]
+    at: dict[int, int] = {}
+    for tag, a1, a2, b1, b2 in difflib.SequenceMatcher(
+        None, [_shape(o) for o in ref], [_shape(o) for o in ops], autojunk=False
+    ).get_opcodes():
+        if tag == "equal" or (tag == "replace" and a2 - a1 == b2 - b1):
+            at.update({a1 + i: b1 + i for i in range(a2 - a1)})
+    edits = []
+    for tag, a1, a2, b1, b2 in difflib.SequenceMatcher(
+        None, [_full(o) for o in ref], [_full(o) for o in ir], autojunk=False
+    ).get_opcodes():
+        changed = ref[a1:a2] + ir[b1:b2]
+        if tag == "equal" or all(_is_poll(o) for o in changed) or all(o["kind"] == "delay" for o in changed):
+            continue
+        idx = [at.get(i) for i in range(a1, a2)]
+        if tag == "delete":
+            idx = [i for i in idx if i is not None]  # absent from this job too
+            if not idx:
+                continue
+        start = idx[0] if idx else at.get(a1)
+        if start is None or idx != list(range(start, start + len(idx))):
+            raise AsicError(f"infrared change at vendor op {a1} has no place in the {color['dpi']} dpi job")
+        edits.append((start, start + len(idx), ir[b1:b2]))
+    out = list(ops)
+    for start, end, new in sorted(edits, key=lambda e: e[0], reverse=True):
+        out[start:end] = new
+
+    # shading: unity gain while the white frame is read, then computed from it
+    lamp = ir_ref["lamp"]
+    white = lamp["shading"]["frame"]
+    pixels = color["frames"][white]["pixels"]
+    unity = shading_table(np.full((pixels, 3), SHADING_UNITY))
+    regs: dict[int, int] = {}
+    frames_read: set[int] = set()
+    offset: dict[bool, int] = {}
+    for i, o in enumerate(out):
+        if o["kind"] == "control" and o["rt"] == 0x40 and o["value"] == 0x83 and len(o["data"]) > 1:
+            regs.update(zip(o["data"][::2], o["data"][1::2], strict=True))
+        elif o["kind"] == "read":
+            frames_read.add(o["frame"])
+        elif o["kind"] == "write" and (regs.get(0x5B), regs.get(0x5C)) == (0x10, 0x00):  # shading RAM
+            n = len(base64.b64decode(o["data"]))
+            live = white in frames_read
+            o0 = offset.get(live, 0)
+            offset[live] = o0 + n
+            out[i] = ({"kind": "write", "length": n, "shading": {"frame": white, "offset": o0}} if live
+                      else {"kind": "write", "data": base64.b64encode(unity[o0 : o0 + n]).decode()})
+    if set(offset.values()) != {len(unity)}:
+        raise AsicError("infrared shading uploads not found")
+
+    frames = [{**f, "regs": {**f["regs"], **{k: ir_ref["frames"][i]["regs"][k] for k in ("3", "168")}}}
+              for i, f in enumerate(color["frames"])]
+    return {**color, "ops": out, "frames": frames, "lamp": lamp,
+            "name": f"Derived full frame {color['dpi']}, infrared",
+            "source": f"{color['source']} with the infrared changes of {ir_ref['source']}"}
+
+
 def validate_profile(profile: dict) -> None:
     """Refuse a profile whose frames are incomplete or whose image reads outlast the scan."""
     planned: dict[int, int] = {}
@@ -207,6 +313,7 @@ def run_profile(profile: dict, usb, hooks: ReplayHooks | None = None) -> ReplayR
     buffers = {i: bytearray(frames[i]["bytes"]) for i in calib_frames | {main}}
     got = dict.fromkeys(range(len(frames)), 0)
     result = ReplayResult(main=buffers[main])
+    shading: dict[int, bytes] = {}
     pool = ThreadPoolExecutor(max_workers=1)
 
     def raw(op: dict) -> bytes:
@@ -339,7 +446,13 @@ def run_profile(profile: dict, usb, hooks: ReplayHooks | None = None) -> ReplayR
                 h.check()
                 control(op)
             elif op["kind"] == "write":
-                payload = base64.b64decode(op["data"])
+                if "shading" in op:
+                    f, start = op["shading"]["frame"], op["shading"]["offset"]
+                    if f not in shading:
+                        shading[f] = white_shading(result.frames[f], frames[f]["pixels"])
+                    payload = shading[f][start : start + op["length"]]
+                else:
+                    payload = base64.b64decode(op["data"])
                 if transport.bulk_write(payload) != len(payload):
                     raise ScanError("short bulk upload")
             else:

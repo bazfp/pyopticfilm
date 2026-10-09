@@ -85,7 +85,7 @@ def crop(rgb: np.ndarray, area: tuple[float, float, float, float] | None) -> np.
 
 
 class Gl843V1ScanSession:
-    """Colour (1440 / 3600 / 7200 dpi), infrared and colour + infrared (3600 dpi) scans."""
+    """Colour (1440 / 3600 / 7200 dpi), infrared and colour + infrared (3600 / 7200 dpi) scans."""
 
     def __init__(self, asic, model=MODEL_7600I_V1, calibrator=None) -> None:
         self.asic = asic
@@ -120,7 +120,8 @@ class Gl843V1ScanSession:
         if resolution not in self.model.resolutions_dpi:
             raise ValueError(f"{self.model.model} scans at {', '.join(map(str, sorted(self.model.resolutions_dpi)))} dpi")
         if (mode == "infrared" or infrared) and resolution not in self.model.infrared_resolutions_dpi:
-            raise ValueError(f"{self.model.model} scans infrared at 3600 dpi only")
+            dpis = ", ".join(map(str, sorted(self.model.infrared_resolutions_dpi)))
+            raise ValueError(f"{self.model.model} scans infrared at {dpis} dpi")
         if not self.asic._initialized:
             self.asic.init()
 

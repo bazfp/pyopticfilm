@@ -29,6 +29,14 @@ def _load_data() -> dict:
     return json.loads(gzip.decompress(raw))
 
 
+@lru_cache(maxsize=1)
+def _infrared_7200() -> dict:
+    from pyopticfilm.scan.replay_gl843_v1 import derive_infrared
+
+    p = _load_data()["profiles"]
+    return derive_infrared(p["color_7200"], p["color_3600"], p["infrared_3600"])
+
+
 @dataclass(frozen=True)
 class Model7600iV1:
     name: str = "plustek-opticfilm-7600i-v1"
@@ -39,7 +47,7 @@ class Model7600iV1:
     usb_product_id: int = 0x0C3B
     scan_ready: bool = True
     resolutions_dpi: tuple[int, ...] = (7200, 3600, 1440)
-    infrared_resolutions_dpi: tuple[int, ...] = (3600,)
+    infrared_resolutions_dpi: tuple[int, ...] = (7200, 3600)
     bpp_gray: tuple[int, ...] = ()
     bpp_color: tuple[int, ...] = (16,)
     supports_infrared: bool = True
@@ -91,9 +99,12 @@ class Model7600iV1:
         return _load_data()
 
     def replay_profile(self, mode: str, dpi: int) -> dict:
-        """A copy of the vendor job for ``mode`` ("color" / "infrared") at ``dpi``."""
+        """A copy of the vendor job for ``mode`` ("color" / "infrared") at ``dpi``; infrared at 7200 dpi
+        is derived from the 7200 dpi colour job (not captured)."""
         key = f"{'infrared' if mode == 'infrared' else 'color'}_{dpi}"
         profiles = self.replay_data()["profiles"]
+        if key == "infrared_7200":
+            return copy.deepcopy(_infrared_7200())
         if key not in profiles:
             raise ValueError(f"{self.model} has no {mode} sequence at {dpi} dpi")
         return copy.deepcopy(profiles[key])

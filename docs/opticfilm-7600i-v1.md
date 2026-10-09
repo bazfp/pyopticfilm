@@ -8,7 +8,7 @@ that resolution, from USB captures of a real 7600i v1 (sequences and findings fr
 | | |
 |---|---|
 | Colour | 1440, 3600, 7200 dpi full frame, 16-bit linear RGB |
-| Infrared | 3600 dpi (`mode="infrared"`, or `infrared=True` with colour) |
+| Infrared | 3600, 7200 dpi (`mode="infrared"`, or `infrared=True` with colour) |
 | Crop | `area=`, on the host |
 | Not yet | multi-exposure, other resolutions, grey |
 
@@ -20,6 +20,9 @@ Differences from the SANE GL843 path:
   the recorded time (2.56–2.57 s). Homing uses the vendor's motor primitives.
 - The image arrives mirrored, with twice as many lines as columns and fractional R/G/B delays;
   7200 dpi has an 8-line column stagger. Infrared is read by the red row.
+- Infrared at 7200 dpi was not captured: it is the 7200 dpi colour job with the changes SilverFast
+  makes for infrared at 3600 dpi (lamp off, infrared LED, AFE), and shading computed from the job's
+  white frame as SilverFast does (`0x13000 × 0x2000 / white`).
 
 Validation: `tests/test_opticfilm_7600i_v1.py` replays every job against strict playback of the
 capture (any transfer that differs from SilverFast's fails), and covers boot, homing, image

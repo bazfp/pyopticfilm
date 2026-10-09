@@ -16,7 +16,7 @@ def test_identity_and_scan_flags():
     assert MODEL_7600I_V1.supports_infrared is True
     assert MODEL_7600I_V1.mirror_x is True
     assert MODEL_7600I_V1.resolutions_dpi == (7200, 3600, 1440)
-    assert MODEL_7600I_V1.infrared_resolutions_dpi == (3600,)
+    assert MODEL_7600I_V1.infrared_resolutions_dpi == (7200, 3600)
     assert MODEL_7600I_V1.dummy_lines == "recorded"
     assert MODEL_7600I_V1.stagger_y_by_dpi[7200] == (4, 0)
 
