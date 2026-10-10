@@ -182,7 +182,7 @@ class Gl843V1ScanSession:
         hooks = ReplayHooks(check=check_cancel(cancel), sleep=self.sleep, now=self.now, frame_done=frame_done,
                             progress=lambda i, got, total: report(got / total) if i == main else None)
         try:
-            result = run_profile(profile, asic.usb, hooks)
+            result = run_profile(profile, asic.usb, hooks, calibrate=apply_calib)
         except BaseException:
             asic.forget_motor_tables()
             for cleanup in (asic.stop_motor, asic.protocol.abort_bulk_stream):  # stop, then drain bulk IN
@@ -204,11 +204,11 @@ class Gl843V1ScanSession:
         asic.position_known = True
         asic.lamp_on_at = (asic.lamp_on_at or self.now()) if asic.usb.shadow.get(0x03, 0) & 0x10 else None
 
-        offsets = info.get("dark_delta") if apply_calib and job == "color" else None
-        info.update(black_offsets=offsets, positioning_stop_ms=result.positioning_stop_ms)
+        info["calibration"] = "live" if apply_calib else "recorded"
+        info.update(black_offsets=None, positioning_stop_ms=result.positioning_stop_ms)
         self.last_scan_info[job] = info
         yres = profile["yres"]
         frame = profile["frames"][main]
         return assemble(result.main, pixels=frame["pixels"], lines=frame["lines"], dpi=resolution, yres=yres,
-                        shifts=shifts_for(yres), offsets=offsets, mirror=self.model.mirror_x,
+                        shifts=shifts_for(yres), mirror=self.model.mirror_x,
                         stagger=tuple(round(v * yres / 7200) for v in self.model.stagger_y_by_dpi[resolution]))

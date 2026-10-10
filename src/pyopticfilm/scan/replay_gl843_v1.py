@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from pyopticfilm.exceptions import AsicError, ScanCancelled, ScanError
+from pyopticfilm.scan.calib_gl843_v1 import Calibration
 
 STATUS = 0x41
 MOTORENB = 0x01
@@ -426,15 +427,18 @@ class ReplayResult:
     positioning_stop_ms: float | None = None
 
 
-def run_profile(profile: dict, usb, hooks: ReplayHooks | None = None) -> ReplayResult:
-    """Replay ``profile`` on ``usb`` (:class:`~pyopticfilm.asic.gl843_v1.Gl843V1Usb`)."""
+def run_profile(profile: dict, usb, hooks: ReplayHooks | None = None, *, calibrate: bool = False) -> ReplayResult:
+    """Replay a job; ``calibrate`` replaces recorded AFE/shading with live measurements."""
     h = hooks or ReplayHooks()
     validate_profile(profile)
     transport = usb.transport
     frames = profile["frames"]
     main = profile["mainFrame"]
+    calibration = Calibration(profile) if calibrate else None
     lamp = profile.get("lamp") or {}
     calib_frames = {lamp[k]["frame"] for k in ("line", "shading", "dark") if k in lamp}
+    if calibration:
+        calib_frames.update(range(calibration.first, calibration.white + 1))
     # without backtracking a slow host only pauses the carriage, so the rate is not enforced
     need = profile["scan"]["bytesPerSecond"] if profile["scan"].get("backtracking", True) else 0
     regs: dict[int, int] = {}
@@ -552,7 +556,9 @@ def run_profile(profile: dict, usb, hooks: ReplayHooks | None = None) -> ReplayR
                 h.progress(i, got[i], size)
         if i != main and i in buffers and got[i] == size:
             result.frames[i] = bytes(buffers[i])
-            if h.frame_done is not None:
+            if calibration:
+                calibration.frame_done(i, result.frames[i])
+            if h.frame_done is not None and i in {lamp[k]["frame"] for k in lamp}:
                 h.frame_done(i, result.frames[i])
 
     try:
@@ -573,9 +579,12 @@ def run_profile(profile: dict, usb, hooks: ReplayHooks | None = None) -> ReplayR
                 result.positioning_stop_ms = (h.now() - st["moved"]) * 1000
             elif op["kind"] == "control":
                 h.check()
-                control(op)
+                control(calibration.control(op) if calibration else op)
             elif op["kind"] == "write":
-                if "shading" in op:
+                if calibration and (regs.get(0x5B), regs.get(0x5C)) == (0x10, 0):
+                    size = op.get("length") or len(base64.b64decode(op["data"]))
+                    payload = calibration.upload(size)
+                elif "shading" in op:
                     f, start = op["shading"]["frame"], op["shading"]["offset"]
                     if f not in shading:
                         w = op["shading"].get("widen")

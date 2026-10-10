@@ -359,8 +359,8 @@ def test_scanner_end_to_end_on_simulated_scanner(monkeypatch, tmp_path):
         image = scanner.scan(resolution=1440)
     assert image.rgb.shape == (1402, 2076, 3)  # sensor pixels 83-10463 and image.rgb.dtype == np.uint16
     assert image.dpi == 1440 and image.ir is None
-    # simulated light level minus the measured black-level difference
-    assert abs(int(image.rgb[700, 1000, 1]) - (sim.lit_rgb[1] - (sim.dark_rgb[1] - 1059.5))) <= 1
+    # Live shading owns black correction; do not subtract a global offset again.
+    assert int(image.rgb[700, 1000, 1]) == sim.lit_rgb[1]
 
 
 def test_unsupported_requests_are_refused(tmp_path):

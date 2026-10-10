@@ -107,6 +107,7 @@ class SimulatedGl843V1Transport:
     lit_rgb: tuple[int, int, int] = (30000, 40000, 34000)
     dark_rgb: tuple[int, int, int] = (1000, 1070, 1230)
     regs: dict[int, int] = field(default_factory=dict)
+    afe: dict[int, int] = field(default_factory=dict)
     transactions: list[UsbTransaction] = field(default_factory=list)
     address: int = 0
     moving: bool = False
@@ -148,6 +149,8 @@ class SimulatedGl843V1Transport:
 
     def _write(self, reg: int, value: int) -> None:
         self.regs[reg] = value
+        if reg == 0x3B:
+            self.afe[self.regs.get(0x51, 0)] = self.regs.get(0x3A, 0) * 256 + value
         feedl = (self.regs.get(0x3D, 0) << 16) | (self.regs.get(0x3E, 0) << 8) | self.regs.get(0x3F, 0)
         if reg == 0x0F and value == 1:
             self.moving = True
@@ -193,6 +196,17 @@ class SimulatedGl843V1Transport:
         self.transactions.append(UsbTransaction(operation="bulk_read", length=size))
         lit = bool(self.regs.get(0x03, 0) & 0x10) or self.regs.get(0xA8) == 0x27
         r, g, b = self.lit_rgb if lit else self.dark_rgb
+        start_pixel = self.regs.get(0x30, 0) * 256 + self.regs.get(0x31, 0)
+        end_pixel = self.regs.get(0x32, 0) * 256 + self.regs.get(0x33, 0)
+        dpi = self.regs.get(0x2C, 0) * 256 + self.regs.get(0x2D, 0)
+        if dpi and (end_pixel - start_pixel) * dpi // 1200 == 512:
+            values = []
+            for c in range(3):
+                offset = self.afe.get(5 + c, 128)
+                offset = -(offset & 255) if offset & 256 else offset
+                gain = 6 / (6 - 5 * self.afe.get(2 + c, 0) / 63)
+                values.append(max(0, min(65535, int((offset + 70) * 20 * gain))))
+            r, g, b = values
         pixel = bytes((r & 0xFF, r >> 8, g & 0xFF, g >> 8, b & 0xFF, b >> 8))
         start = self.read_phase % 6
         self.read_phase += size

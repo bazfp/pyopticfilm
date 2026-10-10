@@ -26,16 +26,19 @@ Differences from the SANE GL843 path:
   makes for infrared at 3600 dpi (lamp off, infrared LED, AFE), and shading computed from the job's
   white frame as SilverFast does (`0x13000 × 0x2000 / white`).
 
-- The wider window adds pixels in front of the recorded shading tables. While the white frame is
-  read they take the first recorded pixels' words (per column parity). All final gains are computed
-  from the job's white frame (`target / white`, per-channel target from the recorded gains).
+- Every scan calibrates from its live probes: four-pixel peak means select AFE gains;
+  32 black pixels determine offsets; 128-line references discard eight extremes at each end.
+  Dark correction uses a forward 100-value mean (separate column parities at 7200 dpi).
+  Both shading uploads cover the actual window, including added pixels and infrared hot columns.
 
 Validation: `tests/test_opticfilm_7600i_v1.py` replays every job against strict playback of the
 capture (any transfer that differs from SilverFast's fails), and covers boot, homing, image
 assembly and an end-to-end `Scanner.open_fake` scan on a simulated GL843.
 
-Limitation: AFE and shading are those of the captured unit. Black-level drift is corrected from
-each job's dark frame; other calibration differences are logged.
+The initial gains, offsets and shading reproduce eight captured calibration passes. The dark
+outlier gate uses inclusive 64; captures constrain this setting to 63..67, rather than uniquely
+identifying it. Final colour gain increments remain 0/+1/+2 as captured. Optical verification on
+hardware is still needed. `apply_calib=False` retains recorded AFE/shading for comparison.
 
 Data: `device/data/opticfilm_7600i_v1.json.gz`, rebuilt with
 `python tools/import_7600i_v1_profiles.py /path/to/OpenOptic`.
