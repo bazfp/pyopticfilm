@@ -51,10 +51,11 @@ def test_live_calibration_substitutes_usb_values(infrared):
             p["ops"] += [{"kind": "write", "data": base64.b64encode(bytes(512)).decode()}] * 2
 
     class USB:
-        frame = 0
-        at = 0
-        writes = []
-        controls = []
+        def __init__(self):
+            self.frame = 0
+            self.at = 0
+            self.writes = []
+            self.controls = []
 
         def control_msg(self, rt, req, value, index, payload):
             self.controls.append(list(payload))
